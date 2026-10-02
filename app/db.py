@@ -37,6 +37,11 @@ def init_db(path: str | None = None) -> None:
     conn = connect(path)
     try:
         conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        # 旧库迁移：期末快照补充 held 列（既有快照按 0 处理——它们生成时
+        # 尚无跨期预留被冻结）。列已存在时忽略。
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(period_balances)")}
+        if "held" not in cols:
+            conn.execute("ALTER TABLE period_balances ADD COLUMN held INTEGER NOT NULL DEFAULT 0")
         # 种入第一个开放期（幂等）
         conn.execute(
             """

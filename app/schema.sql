@@ -1,6 +1,11 @@
 -- 积分账本结构定义 (SQLite)
 -- 设计原则：余额、分录不可变、期末快照、冲正唯一性等关键不变量
 -- 全部由数据库约束 / 触发器 / 部分唯一索引裁决，应用层只做提前校验。
+--
+-- 预留（holds）不是分录，不改变已入账余额；它占用的是“可用余额”。
+-- 全库硬不变量（由触发器裁决，任何写入路径都绕不过）：
+--     可用余额 = SUM(entries.amount) - SUM(active holds.amount) >= 0
+-- 即：余额非负，且有效预留总额永远不超过已入账余额。
 
 CREATE TABLE IF NOT EXISTS accounts (
     id         INTEGER PRIMARY KEY,
@@ -20,11 +25,13 @@ CREATE TABLE IF NOT EXISTS periods (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_periods_single_open
     ON periods(id) WHERE status = 'open';
 
--- 关期时写入的期末余额快照（不可修改、不可删除，见触发器）
+-- 关期时写入的期末余额快照（不可修改、不可删除，见触发器）。
+-- held = 截至关期仍有效（active）的预留额，跨期预留随之被冻结进快照。
 CREATE TABLE IF NOT EXISTS period_balances (
     period_id  INTEGER NOT NULL REFERENCES periods(id),
     account_id INTEGER NOT NULL REFERENCES accounts(id),
     balance    INTEGER NOT NULL,
+    held       INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (period_id, account_id)
 );
 
@@ -80,10 +87,29 @@ CREATE INDEX IF NOT EXISTS idx_entries_account_period
     ON entries(account_id, period_id);
 
 -- ========== 触发器 ==========
+-- 重新执行本文件时用 DROP + CREATE 替换触发器体（CREATE IF NOT EXISTS 不会更新定义）。
+
+DROP TRIGGER IF EXISTS trg_txn_shape;
+DROP TRIGGER IF EXISTS trg_entry_shape;
+DROP TRIGGER IF EXISTS trg_entry_no_overdraft;
+DROP TRIGGER IF EXISTS trg_entry_period_open;
+DROP TRIGGER IF EXISTS trg_entries_no_update;
+DROP TRIGGER IF EXISTS trg_entries_no_delete;
+DROP TRIGGER IF EXISTS trg_transactions_no_update;
+DROP TRIGGER IF EXISTS trg_transactions_no_delete;
+DROP TRIGGER IF EXISTS trg_snapshot_no_update;
+DROP TRIGGER IF EXISTS trg_snapshot_no_delete;
+DROP TRIGGER IF EXISTS trg_periods_update_gate;
+DROP TRIGGER IF EXISTS trg_periods_no_delete;
+DROP TRIGGER IF EXISTS trg_accounts_code_no_update;
+DROP TRIGGER IF EXISTS trg_accounts_no_delete;
+DROP TRIGGER IF EXISTS trg_holds_no_overdraft;
+DROP TRIGGER IF EXISTS trg_holds_status_gate;
+DROP TRIGGER IF EXISTS trg_holds_no_delete;
 
 -- 交易形状：冲正必须引用一笔已存在的原始交易；只有冲正能带 reversal_of；
 -- 转账必须属于一个批次；opening/deposit/reversal 不得挂批次。
-CREATE TRIGGER IF NOT EXISTS trg_txn_shape
+CREATE TRIGGER trg_txn_shape
 BEFORE INSERT ON transactions
 FOR EACH ROW
 BEGIN
@@ -107,7 +133,7 @@ END;
 
 -- 分录形状：金额非零、期间必须与交易一致、每笔交易至多两条分录、
 -- opening/deposit 只能有一条且为正。
-CREATE TRIGGER IF NOT EXISTS trg_entry_shape
+CREATE TRIGGER trg_entry_shape
 BEFORE INSERT ON entries
 FOR EACH ROW
 BEGIN
@@ -126,19 +152,69 @@ BEGIN
     END;
 END;
 
--- 非负余额：每行插入后按账户重算 SUM，余额为负则由数据库中止该语句
--- （应用层按“先正后负”顺序插入，合法批次不会误杀）。
-CREATE TRIGGER IF NOT EXISTS trg_entry_no_overdraft
+-- 可用余额不可为负：每行插入后按账户重算
+--     SUM(entries) - SUM(active holds as source)
+-- 为负即中止。预留占用的积分因此不可能被任何借方分录（普通转账 / 捕获 /
+-- 冲正）花掉。捕获时应用层先在同一事务把该 hold 翻成 captured，
+-- 该 hold 随即退出占用，随后的借方分录才得以通过。
+CREATE TRIGGER trg_entry_no_overdraft
 AFTER INSERT ON entries
 FOR EACH ROW
-WHEN (SELECT COALESCE(SUM(amount), 0)
-      FROM entries WHERE account_id = NEW.account_id) < 0
+WHEN (
+        SELECT COALESCE(SUM(amount), 0)
+        FROM entries WHERE account_id = NEW.account_id
+     ) - (
+        SELECT COALESCE(SUM(amount), 0)
+        FROM holds
+        WHERE source_id = NEW.account_id AND status = 'active'
+     ) < 0
 BEGIN
-    SELECT RAISE(ABORT, 'account balance must not be negative');
+    SELECT RAISE(ABORT, 'available balance must not be negative');
+END;
+
+-- 预留本身同样受可用余额约束：新预留不得使 source 的可用余额为负。
+CREATE TRIGGER trg_holds_no_overdraft
+AFTER INSERT ON holds
+FOR EACH ROW
+WHEN (
+        SELECT COALESCE(SUM(amount), 0)
+        FROM entries WHERE account_id = NEW.source_id
+     ) - (
+        SELECT COALESCE(SUM(amount), 0)
+        FROM holds
+        WHERE source_id = NEW.source_id AND status = 'active'
+     ) < 0
+BEGIN
+    SELECT RAISE(ABORT, 'hold would overdraw the available balance');
+END;
+
+-- 预留状态机：active -> captured | released，终态不可再变；
+-- 金额 / 双方账户等核心字段不可修改。
+CREATE TRIGGER trg_holds_status_gate
+BEFORE UPDATE ON holds
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN OLD.status = 'active' AND NEW.status NOT IN ('captured', 'released')
+            THEN RAISE(ABORT, 'an active hold may only be captured or released')
+        WHEN OLD.status <> 'active' AND NEW.status <> OLD.status
+            THEN RAISE(ABORT, 'captured or released holds are terminal')
+        WHEN NEW.ref <> OLD.ref OR NEW.amount <> OLD.amount
+             OR NEW.source_id <> OLD.source_id OR NEW.target_id <> OLD.target_id
+             OR NEW.period_id <> OLD.period_id
+            THEN RAISE(ABORT, 'hold core fields are immutable')
+    END;
+END;
+
+-- 预留不可删除：要解除占用只能 release（保留审计轨迹）
+CREATE TRIGGER trg_holds_no_delete
+BEFORE DELETE ON holds
+BEGIN
+    SELECT RAISE(ABORT, 'holds cannot be deleted; release them instead');
 END;
 
 -- 关闭后的期间不得补写任何分录（转账与关期并发由数据库裁决）
-CREATE TRIGGER IF NOT EXISTS trg_entry_period_open
+CREATE TRIGGER trg_entry_period_open
 AFTER INSERT ON entries
 FOR EACH ROW
 WHEN (SELECT status FROM periods WHERE id = NEW.period_id) = 'closed'
@@ -147,43 +223,43 @@ BEGIN
 END;
 
 -- 分录不可修改、不可删除（冲正只能追加反向分录）
-CREATE TRIGGER IF NOT EXISTS trg_entries_no_update
+CREATE TRIGGER trg_entries_no_update
 BEFORE UPDATE ON entries
 BEGIN
     SELECT RAISE(ABORT, 'entries are immutable and cannot be updated');
 END;
-CREATE TRIGGER IF NOT EXISTS trg_entries_no_delete
+CREATE TRIGGER trg_entries_no_delete
 BEFORE DELETE ON entries
 BEGIN
     SELECT RAISE(ABORT, 'entries cannot be deleted; post a reversal instead');
 END;
 
 -- 交易本身同样不可修改、不可删除
-CREATE TRIGGER IF NOT EXISTS trg_transactions_no_update
+CREATE TRIGGER trg_transactions_no_update
 BEFORE UPDATE ON transactions
 BEGIN
     SELECT RAISE(ABORT, 'transactions are immutable and cannot be updated');
 END;
-CREATE TRIGGER IF NOT EXISTS trg_transactions_no_delete
+CREATE TRIGGER trg_transactions_no_delete
 BEFORE DELETE ON transactions
 BEGIN
     SELECT RAISE(ABORT, 'transactions cannot be deleted; post a reversal instead');
 END;
 
 -- 快照不可修改、不可删除
-CREATE TRIGGER IF NOT EXISTS trg_snapshot_no_update
+CREATE TRIGGER trg_snapshot_no_update
 BEFORE UPDATE ON period_balances
 BEGIN
     SELECT RAISE(ABORT, 'period balance snapshots are immutable');
 END;
-CREATE TRIGGER IF NOT EXISTS trg_snapshot_no_delete
+CREATE TRIGGER trg_snapshot_no_delete
 BEFORE DELETE ON period_balances
 BEGIN
     SELECT RAISE(ABORT, 'period balance snapshots cannot be deleted');
 END;
 
 -- 期间只允许 open -> closed 这一种变更，关闭后不可重开，不可删除
-CREATE TRIGGER IF NOT EXISTS trg_periods_update_gate
+CREATE TRIGGER trg_periods_update_gate
 BEFORE UPDATE ON periods
 FOR EACH ROW
 BEGIN
@@ -198,20 +274,20 @@ BEGIN
             THEN RAISE(ABORT, 'the only allowed period change is open -> closed')
     END;
 END;
-CREATE TRIGGER IF NOT EXISTS trg_periods_no_delete
+CREATE TRIGGER trg_periods_no_delete
 BEFORE DELETE ON periods
 BEGIN
     SELECT RAISE(ABORT, 'periods cannot be deleted');
 END;
 
 -- 账户不可修改编码、不可删除（外键 + 触发器双重保护）
-CREATE TRIGGER IF NOT EXISTS trg_accounts_code_no_update
+CREATE TRIGGER trg_accounts_code_no_update
 BEFORE UPDATE ON accounts
 FOR EACH ROW WHEN NEW.code <> OLD.code
 BEGIN
     SELECT RAISE(ABORT, 'account code is immutable');
 END;
-CREATE TRIGGER IF NOT EXISTS trg_accounts_no_delete
+CREATE TRIGGER trg_accounts_no_delete
 BEFORE DELETE ON accounts
 BEGIN
     SELECT RAISE(ABORT, 'accounts cannot be deleted');
