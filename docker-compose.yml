@@ -1,0 +1,31 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: points-ledger:latest
+    environment:
+      LEDGER_DB_PATH: /data/ledger.db
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ledger-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  # 一次性验收测试服务：docker compose run --rm verify
+  verify:
+    image: points-ledger:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      LEDGER_DB_PATH: /tmp/verify/ledger.db
+    command: ["pytest", "-v", "--tb=short", "tests"]
+
+volumes:
+  ledger-data:
