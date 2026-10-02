@@ -15,6 +15,8 @@
 | --- | --- |
 | 余额是整数、非零 | `entries.amount INTEGER` + `CHECK (amount <> 0)`；API 层 Pydantic `StrictInt` |
 | 余额不可为负 | 触发器 `trg_entry_no_overdraft`：每行插入后按账户重算 `SUM(amount)`，为负即 `RAISE(ABORT)` |
+| 可用余额不可为负（预留不可超额、转账/冲正不可花掉已预留积分） | 触发器 `trg_entry_no_overcommit`（分录后校验 `SUM(entries) < SUM(active holds)`）+ `trg_hold_no_overcommit`（插入预留后同式校验），并发由 `BEGIN IMMEDIATE` 写锁串行化 |
+| 预留只能 `active → captured/released` 一次、字段不可变、不可删除 | 触发器 `trg_holds_status_gate` / `trg_holds_no_delete`；捕获与记账在同一事务完成，重复捕获/释放幂等返回终态 |
 | 每笔转账两条相反分录、借贷平衡 | 触发器 `trg_entry_shape`：每笔交易最多两条分录；opening/deposit 仅一条且为正 |
 | 一批转账原子提交 | 单事务 `BEGIN IMMEDIATE`，失败整体 `ROLLBACK` |
 | 冲正最多成功一次 | 部分唯一索引 `idx_txn_reversal_once ON transactions(reversal_of) WHERE reversal_of IS NOT NULL` |
@@ -26,7 +28,14 @@
 | 快照与分录一致 | 快照在同一把写锁内由 `SUM(entries)` 计算并提交 |
 
 冲正的反向分录**记入当前开放期**（而不是原交易所在期），原分录原样保留，
-因此已关闭期的期末快照永远不变。
+因此已关闭期的期末快照永远不变。期末快照同时保存关期瞬间的 `balance`（已入账余额）
+与 `held`（仍 active 的跨期预留额）/ `available`：后期捕获或释放只改当期余额，
+旧快照的两个口径各自冻结、互不矛盾。
+
+预留语义：`available = balance − SUM(active holds)` 恒为非负。预留本身不写分录、
+不动已入账余额；**捕获在单个事务内先把预留翻成 captured 再写两条转账分录**
+（因此触发器不会把合法捕获误判为花掉预留积分），释放只是状态迁移。
+捕获、释放均为一次性操作，重复请求返回同一终态（幂等），绝不重复转账。
 
 ## 运行
 
@@ -59,7 +68,7 @@ docker compose run --rm verify
 | `GET /transactions` / `GET /transactions/{ref}` | 查询交易及其分录 |
 | `POST /periods/close` | 关闭当前开放期：写期末快照并开启下一期 |
 | `GET /periods` | 期间列表（始终恰有一个 open） |
-| `GET /periods/{id}/snapshot` | 已关闭期的期末余额快照 |
+| `GET /periods/{id}/snapshot` | 已关闭期的期末余额快照（`balance` / `held` / `available`） |
 
 批次转账示例：
 
@@ -88,6 +97,11 @@ curl -X POST http://127.0.0.1:8000/transfers/batches \
   - 200 批并发转账串行化、不丢不重、余额与重算一致、全库借贷平衡；
   - 20 个并发超额提款 → 成功总额恰好等于余额，其余全部拒绝；
   - 转账与关期并发 → 单笔交易的两条分录绝不跨期分裂，快照与重算永远一致。
+- `test_holds.py`（预留）：两笔 80/100 超额预留被拒且 `available>=0`；预留不写分录；
+  普通批量/冲正不能花掉已预留积分，因此早先成功的预留始终能捕获；
+  捕获重复请求幂等只转一次、释放重复幂等、释放后不可捕获、捕获后不可释放；
+  并发捕获 vs 释放恰有一个结果；并发预留总额绝不超过余额；
+  跨期预留捕获落入新期且旧期快照（含 `held`）不变；预留状态机由数据库触发器强制。
 - `test_rollback.py`（故障回滚）：记账中途注入 I/O 故障（第 1/中间/最后一条分录），
   整批零残留；多笔合计透支整批拒绝；冲正中途失败不留半截；未提交事务在连接丢失
   （模拟进程崩溃）后从磁盘重开数据库自动回滚。

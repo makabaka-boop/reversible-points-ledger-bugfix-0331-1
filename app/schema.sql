@@ -21,10 +21,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_periods_single_open
     ON periods(id) WHERE status = 'open';
 
 -- 关期时写入的期末余额快照（不可修改、不可删除，见触发器）
+-- balance：截至该期已入账余额（= 该账户全部分录之和）
+-- held_balance：关期瞬间仍 active 的预留额（跨期预留仍有效，故不归零）
 CREATE TABLE IF NOT EXISTS period_balances (
-    period_id  INTEGER NOT NULL REFERENCES periods(id),
-    account_id INTEGER NOT NULL REFERENCES accounts(id),
-    balance    INTEGER NOT NULL,
+    period_id    INTEGER NOT NULL REFERENCES periods(id),
+    account_id   INTEGER NOT NULL REFERENCES accounts(id),
+    balance      INTEGER NOT NULL,
+    held_balance INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (period_id, account_id)
 );
 
@@ -49,7 +52,6 @@ CREATE TABLE IF NOT EXISTS holds (
 );
 CREATE INDEX IF NOT EXISTS idx_holds_active_source
     ON holds(source_id) WHERE status = 'active';
-
 CREATE TABLE IF NOT EXISTS transactions (
     id          INTEGER PRIMARY KEY,
     ref         TEXT NOT NULL UNIQUE,
@@ -135,6 +137,56 @@ WHEN (SELECT COALESCE(SUM(amount), 0)
       FROM entries WHERE account_id = NEW.account_id) < 0
 BEGIN
     SELECT RAISE(ABORT, 'account balance must not be negative');
+END;
+
+-- 非负可用余额：已入账余额不得低于该账户仍 active 的预留总额。
+-- 这同时裁决了两类路径，应用层无法绕过：
+--   * 普通转账/冲正试图花掉已被预留占用的积分（按“先正后负”插入，
+--     捕获预留时先把预留翻成 captured，再插借方分录，因此合法捕获不会误杀）；
+--   * 预留跨行（含并发预留，由 BEGIN IMMEDIATE 写锁 + 本触发器裁决）。
+CREATE TRIGGER IF NOT EXISTS trg_entry_no_overcommit
+AFTER INSERT ON entries
+FOR EACH ROW
+WHEN (SELECT COALESCE(SUM(amount), 0) FROM entries
+      WHERE account_id = NEW.account_id)
+     < (SELECT COALESCE(SUM(amount), 0) FROM holds
+        WHERE source_id = NEW.account_id AND status = 'active')
+BEGIN
+    SELECT RAISE(ABORT, 'transfer would spend reserved points');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_hold_no_overcommit
+AFTER INSERT ON holds
+FOR EACH ROW
+WHEN (SELECT COALESCE(SUM(amount), 0) FROM entries
+      WHERE account_id = NEW.source_id)
+     < (SELECT COALESCE(SUM(amount), 0) FROM holds
+        WHERE source_id = NEW.source_id AND status = 'active')
+BEGIN
+    SELECT RAISE(ABORT, 'insufficient available balance for hold');
+END;
+
+-- 预留状态机：只允许 active -> captured / active -> released，
+-- 金额与账户等其他字段一律不可变；行本身不可删除。
+CREATE TRIGGER IF NOT EXISTS trg_holds_status_gate
+BEFORE UPDATE ON holds
+FOR EACH ROW
+WHEN NOT (OLD.status = 'active'
+          AND NEW.status IN ('captured', 'released')
+          AND OLD.id = NEW.id
+          AND OLD.ref = NEW.ref
+          AND OLD.source_id = NEW.source_id
+          AND OLD.target_id = NEW.target_id
+          AND OLD.amount = NEW.amount
+          AND OLD.period_id = NEW.period_id
+          AND OLD.created_at = NEW.created_at)
+BEGIN
+    SELECT RAISE(ABORT, 'hold can only move active -> captured/released, other fields are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_holds_no_delete
+BEFORE DELETE ON holds
+BEGIN
+    SELECT RAISE(ABORT, 'holds cannot be deleted; release them instead');
 END;
 
 -- 关闭后的期间不得补写任何分录（转账与关期并发由数据库裁决）

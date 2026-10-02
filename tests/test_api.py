@@ -135,3 +135,48 @@ def test_deposit_and_reversal_http(client):
     # 再次冲正失败
     assert client.post("/reversals",
                        json={"ref": "rd2", "original_ref": "d1"}).status_code == 409
+
+
+def test_hold_capture_release_over_http(client):
+    client.post("/accounts", json={"code": "A", "opening_balance": 100})
+    client.post("/accounts", json={"code": "B"})
+    client.post("/accounts", json={"code": "C"})
+
+    # 预留成功只占可用额度，不产生分录
+    assert client.post("/holds", json={
+        "ref": "h1", "source": "A", "target": "B", "amount": 80
+    }).status_code == 201
+    a = client.get("/accounts/A").json()
+    assert (a["balance"], a["held"], a["available"]) == (100, 80, 20)
+
+    # 超额预留拒绝（400），available 永不为负
+    r = client.post("/holds", json={"ref": "h2", "source": "A", "target": "C", "amount": 80})
+    assert r.status_code == 400
+
+    # 普通批量转账不能花掉已预留积分
+    r = client.post("/transfers/batches", json={
+        "ref": "b1", "transfers": [{"from": "A", "to": "C", "amount": 50}]})
+    assert r.status_code == 400
+    # 花可用部分可以
+    assert client.post("/transfers/batches", json={
+        "ref": "b2", "transfers": [{"from": "A", "to": "C", "amount": 20}]}).status_code == 201
+
+    # 早先的预留一定能捕获；重复捕获幂等、不重复转账
+    assert client.post("/holds/h1/capture").status_code == 200
+    assert client.post("/holds/h1/capture").status_code == 200
+    a = client.get("/accounts/A").json()
+    assert (a["balance"], a["held"], a["available"]) == (0, 0, 0)
+    assert client.get("/accounts/B").json()["balance"] == 80
+
+    # 已捕获不能再释放
+    assert client.post("/holds/h1/release").status_code == 409
+
+    # 释放幂等，释放后不能捕获
+    client.post("/holds", json={"ref": "h3", "source": "B", "target": "A", "amount": 30})
+    assert client.post("/holds/h3/release").status_code == 200
+    assert client.post("/holds/h3/release").status_code == 200
+    assert client.post("/holds/h3/capture").status_code == 409
+
+    # 余额与重算一致
+    assert {x["code"]: x["balance"]
+            for x in client.get("/accounts").json()} == _replay(client)

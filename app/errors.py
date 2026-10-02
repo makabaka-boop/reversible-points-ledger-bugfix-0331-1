@@ -24,7 +24,13 @@ class InvalidRequest(LedgerError):
     status_code = 400
 
 
-def translate_integrity_error(exc: sqlite3.IntegrityError) -> Conflict:
-    """把数据库裁决出来的约束/触发器冲突转成 409 Conflict。"""
+def translate_integrity_error(exc: sqlite3.IntegrityError) -> LedgerError:
+    """把数据库裁决出来的约束/触发器冲突转成合适的业务错误。
+
+    * 可用余额不足类触发器（预留超额、转账花掉已预留积分）-> 400；
+    * 其余唯一约束 / 状态机冲突 -> 409。
+    """
     msg = str(exc)
+    if "insufficient available balance for hold" in msg or "reserved points" in msg:
+        return InvalidRequest(msg)
     return Conflict(msg)

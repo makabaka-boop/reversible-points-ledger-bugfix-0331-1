@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .db import current_open_period
-from .errors import Conflict, InvalidRequest, NotFound
+from .errors import Conflict, InvalidRequest, NotFound, translate_integrity_error
 
 
 @contextmanager
@@ -93,6 +93,18 @@ def deposit(conn: sqlite3.Connection, code: str, amount: int, ref: str) -> dict:
         return _get_transaction(conn, txn_id)
 
 
+def _held(conn: sqlite3.Connection, account_id: int) -> int:
+    return conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM holds WHERE source_id = ? AND status = 'active'",
+        (account_id,),
+    ).fetchone()[0]
+
+
+def _available(conn: sqlite3.Connection, account_id: int) -> int:
+    """可用余额 = 已入账余额 - 仍 active 的预留额。"""
+    return _balance(conn, account_id) - _held(conn, account_id)
+
+
 # ---------------------------------------------------------------- 预留 / 捕获
 def get_hold(conn: sqlite3.Connection, ref: str) -> dict:
     row = conn.execute(
@@ -117,32 +129,90 @@ def create_hold(conn: sqlite3.Connection, ref: str, source: str, target: str, am
         accounts = _account_map(conn, {source, target})
         if len(accounts) != 2:
             raise InvalidRequest("hold references an unknown account")
-        if _balance(conn, accounts[source]["id"]) < amount:
-            raise InvalidRequest("insufficient balance for hold")
+        if _available(conn, accounts[source]["id"]) < amount:
+            raise InvalidRequest("insufficient available balance for hold")
         period = current_open_period(conn)
-        conn.execute(
-            "INSERT INTO holds (ref, source_id, target_id, amount, period_id) VALUES (?, ?, ?, ?, ?)",
-            (ref, accounts[source]["id"], accounts[target]["id"], amount, period["id"]),
-        )
+        try:
+            conn.execute(
+                "INSERT INTO holds (ref, source_id, target_id, amount, period_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ref, accounts[source]["id"], accounts[target]["id"], amount, period["id"]),
+            )
+        except sqlite3.IntegrityError as exc:
+            # 并发预留把可用余额抢光时，trg_hold_no_overcommit 在数据库侧裁决
+            raise translate_integrity_error(exc) from exc
         return get_hold(conn, ref)
 
 
 def capture_hold(conn: sqlite3.Connection, ref: str) -> dict:
-    hold = get_hold(conn, ref)
-    if hold["status"] != "active":
-        raise Conflict(f"hold is already {hold['status']}")
-    post_batch(conn, f"hold:{ref}", [{"from": hold["source"],
-                                      "to": hold["target"], "amount": hold["amount"]}])
+    """原子地把 active 预留翻成 captured 并记账；重复请求幂等返回既有结果。
+
+    状态翻转与转账分录必须在同一事务同一把写锁内完成：否则捕获记账与
+    释放并发时，会出现“钱已转走、预留已释放”或反之的矛盾状态。
+    """
     with immediate(conn):
-        conn.execute("UPDATE holds SET status = 'captured' WHERE ref = ?", (ref,))
+        row = conn.execute(
+            """SELECT h.*, s.code AS source, t.code AS target
+               FROM holds h JOIN accounts s ON s.id = h.source_id
+               JOIN accounts t ON t.id = h.target_id WHERE h.ref = ?""",
+            (ref,),
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"unknown hold: {ref}")
+
+        if row["status"] == "captured":
+            # 客户端重试：捕获是幂等的，绝不重复转账
+            return get_hold(conn, ref)
+        if row["status"] == "released":
+            raise Conflict("hold was released and cannot be captured")
+
+        period = current_open_period(conn)
+        batch_ref = f"hold:{ref}"
+        if conn.execute("SELECT 1 FROM batches WHERE ref = ?", (batch_ref,)).fetchone():
+            raise Conflict(f"duplicate batch ref: {batch_ref}")
+
+        # 先占用预留行（active -> captured），再记账。之后插借方分录时
+        # 该笔金额已不计入 held，trg_entry_no_overcommit 不会误杀合法捕获；
+        # 而同事务内的释放 / 重复捕获会因状态机（trg_holds_status_gate）失败。
+        conn.execute(
+            "UPDATE holds SET status = 'captured' WHERE id = ? AND status = 'active'",
+            (row["id"],),
+        )
+
+        batch_id = conn.execute(
+            "INSERT INTO batches (ref, note) VALUES (?, ?)",
+            (batch_ref, f"capture of hold {ref}"),
+        ).lastrowid
+        txn_id = conn.execute(
+            "INSERT INTO transactions (ref, type, batch_id, period_id) "
+            "VALUES (?, 'transfer', ?, ?)",
+            (batch_ref + ":0", batch_id, period["id"]),
+        ).lastrowid
+        try:
+            # 先正后负：触发器逐行检查时不会看到“假透支”
+            conn.execute(
+                "INSERT INTO entries (txn_id, account_id, period_id, amount) "
+                "VALUES (?, ?, ?, ?)",
+                (txn_id, row["target_id"], period["id"], row["amount"]),
+            )
+            conn.execute(
+                "INSERT INTO entries (txn_id, account_id, period_id, amount) "
+                "VALUES (?, ?, ?, ?)",
+                (txn_id, row["source_id"], period["id"], -row["amount"]),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise translate_integrity_error(exc) from exc
         return get_hold(conn, ref)
 
 
 def release_hold(conn: sqlite3.Connection, ref: str) -> dict:
     with immediate(conn):
         hold = get_hold(conn, ref)
-        if hold["status"] != "active":
-            raise Conflict(f"hold is already {hold['status']}")
+        if hold["status"] == "released":
+            # 释放重试是幂等的：返回终态而不是报错
+            return hold
+        if hold["status"] == "captured":
+            raise Conflict("hold was captured and cannot be released")
         conn.execute("UPDATE holds SET status = 'released' WHERE ref = ?", (ref,))
         return get_hold(conn, ref)
 
@@ -176,14 +246,18 @@ def post_batch(
         if missing:
             raise InvalidRequest(f"unknown accounts: {missing}")
 
-        # 事务内预检：模拟整批应用后的余额，任何账户为负则整批不记
+        # 事务内预检：模拟整批应用后的可用余额，任何账户为负则整批不记。
+        # 可用余额 = 已入账余额 - active 预留：普通转账绝不能花掉已预留积分。
         balances = {code: _balance(conn, row["id"]) for code, row in accounts.items()}
+        held = {code: _held(conn, row["id"]) for code, row in accounts.items()}
         for t in transfers:
             balances[t["from"]] -= t["amount"]
             balances[t["to"]] += t["amount"]
-        overdrawn = sorted(code for code, bal in balances.items() if bal < 0)
+        overdrawn = sorted(
+            code for code, bal in balances.items() if bal < held[code] or bal < 0
+        )
         if overdrawn:
-            raise InvalidRequest(f"insufficient balance for accounts: {overdrawn}")
+            raise InvalidRequest(f"insufficient available balance for accounts: {overdrawn}")
 
         try:
             batch_id = conn.execute(
@@ -210,11 +284,15 @@ def post_batch(
             ordered.append((txn_ids[idx], accounts[t["from"]]["id"], -t["amount"]))
 
         for txn_id, account_id, amount in ordered:
-            conn.execute(
-                "INSERT INTO entries (txn_id, account_id, period_id, amount) "
-                "VALUES (?, ?, ?, ?)",
-                (txn_id, account_id, period["id"], amount),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO entries (txn_id, account_id, period_id, amount) "
+                    "VALUES (?, ?, ?, ?)",
+                    (txn_id, account_id, period["id"], amount),
+                )
+            except sqlite3.IntegrityError as exc:
+                # 并发预留/关期等由触发器裁决（余额非负、可用余额非负、期间已关）
+                raise translate_integrity_error(exc) from exc
 
         return {
             "ref": ref,
@@ -257,9 +335,13 @@ def post_reversal(conn: sqlite3.Connection, ref: str, original_ref: str) -> dict
 
         affected = {row["account_id"] for row in orig_entries}
         balances = {aid: _balance(conn, aid) for aid in affected}
+        held = {aid: _held(conn, aid) for aid in affected}
         for row in orig_entries:
             balances[row["account_id"]] -= row["amount"]  # 新分录金额 = -原金额
-        overdrawn = sorted(aid for aid, bal in balances.items() if bal < 0)
+        # 已入账余额非负，且不得低于 active 预留额（不能把别人已预留的积分冲回去）
+        overdrawn = sorted(
+            aid for aid, bal in balances.items() if bal < 0 or bal < held[aid]
+        )
         if overdrawn:
             codes = [
                 r["code"]
@@ -268,7 +350,7 @@ def post_reversal(conn: sqlite3.Connection, ref: str, original_ref: str) -> dict
                     tuple(overdrawn),
                 )
             ]
-            raise InvalidRequest(f"reversal would overdraw accounts: {codes}")
+            raise InvalidRequest(f"reversal would overdraw or unreserve held points for accounts: {codes}")
 
         try:
             txn_id = conn.execute(
@@ -282,11 +364,14 @@ def post_reversal(conn: sqlite3.Connection, ref: str, original_ref: str) -> dict
 
         # 原借方(负)最先翻转成新贷方(正)，保证“先正后负”
         for row in sorted(orig_entries, key=lambda r: r["amount"]):
-            conn.execute(
-                "INSERT INTO entries (txn_id, account_id, period_id, amount) "
-                "VALUES (?, ?, ?, ?)",
-                (txn_id, row["account_id"], period["id"], -row["amount"]),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO entries (txn_id, account_id, period_id, amount) "
+                    "VALUES (?, ?, ?, ?)",
+                    (txn_id, row["account_id"], period["id"], -row["amount"]),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise translate_integrity_error(exc) from exc
 
         return _get_transaction(conn, txn_id)
 
@@ -298,22 +383,26 @@ def close_current_period(conn: sqlite3.Connection) -> dict:
     with immediate(conn):
         old = current_open_period(conn)
 
-        # 快照在写锁内计算，必然与已落账分录一致；
+        # 快照在写锁内计算，必然与已落账分录及当时的有效预留一致；
         # 之后向该期插入分录会被 trg_entry_period_open 拒绝。
+        # 跨期预留仍有效（holds 不分期），故同时记录 held：已入账余额快照
+        # 不随后期捕获/释放改变，held 仅描述关期瞬间的占用，两者口径各自自洽。
         snapshot_rows = conn.execute(
             """
             SELECT a.id AS account_id,
                    COALESCE((SELECT SUM(amount) FROM entries e
-                             WHERE e.account_id = a.id), 0) AS balance
+                             WHERE e.account_id = a.id), 0) AS balance,
+                   COALESCE((SELECT SUM(amount) FROM holds h
+                             WHERE h.source_id = a.id AND h.status = 'active'), 0) AS held
             FROM accounts a
             ORDER BY a.id
             """
         ).fetchall()
         for row in snapshot_rows:
             conn.execute(
-                "INSERT INTO period_balances (period_id, account_id, balance) "
-                "VALUES (?, ?, ?)",
-                (old["id"], row["account_id"], row["balance"]),
+                "INSERT INTO period_balances (period_id, account_id, balance, held_balance) "
+                "VALUES (?, ?, ?, ?)",
+                (old["id"], row["account_id"], row["balance"], row["held"]),
             )
 
         conn.execute(
@@ -329,20 +418,14 @@ def close_current_period(conn: sqlite3.Connection) -> dict:
             "closed_period": _period_dict(conn, old["id"]),
             "opened_period": _period_dict(conn, new_id),
             "snapshot": [
-                {"account_id": r["account_id"], "balance": r["balance"]}
+                {"account_id": r["account_id"], "balance": r["balance"],
+                 "held": r["held"], "available": r["balance"] - r["held"]}
                 for r in snapshot_rows
             ],
         }
 
 
 # ---------------------------------------------------------------- 查询
-
-def _held(conn: sqlite3.Connection, account_id: int) -> int:
-    return conn.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM holds WHERE source_id = ? AND status = 'active'",
-        (account_id,),
-    ).fetchone()[0]
-
 
 def _account_dict(row: sqlite3.Row, balance: int, held: int) -> dict:
     return {"id": row["id"], "code": row["code"], "balance": balance,
@@ -428,7 +511,7 @@ def get_period_snapshot(conn: sqlite3.Connection, period_id: int) -> dict:
         raise InvalidRequest(f"period {period_id} is still open; no snapshot exists")
     rows = conn.execute(
         """
-        SELECT pb.account_id, a.code, pb.balance
+        SELECT pb.account_id, a.code, pb.balance, pb.held_balance
         FROM period_balances pb JOIN accounts a ON a.id = pb.account_id
         WHERE pb.period_id = ? ORDER BY pb.account_id
         """,
@@ -437,5 +520,6 @@ def get_period_snapshot(conn: sqlite3.Connection, period_id: int) -> dict:
     return {
         "period": _period_dict(conn, period_id),
         "balances": [{"account_id": r["account_id"], "code": r["code"],
-                      "balance": r["balance"]} for r in rows],
+                      "balance": r["balance"], "held": r["held_balance"],
+                      "available": r["balance"] - r["held_balance"]} for r in rows],
     }

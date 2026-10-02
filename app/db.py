@@ -37,6 +37,12 @@ def init_db(path: str | None = None) -> None:
     conn = connect(path)
     try:
         conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        # 轻量迁移：旧库的 period_balances 可能没有 held_balance 列
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(period_balances)").fetchall()}
+        if "held_balance" not in cols:
+            conn.execute(
+                "ALTER TABLE period_balances ADD COLUMN held_balance INTEGER NOT NULL DEFAULT 0"
+            )
         # 种入第一个开放期（幂等）
         conn.execute(
             """
